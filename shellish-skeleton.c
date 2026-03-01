@@ -1,12 +1,15 @@
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>       
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>    // mkdir, mkfifo
 #include <sys/wait.h>
 #include <termios.h> // termios, TCSANOW, ECHO, ICANON
 #include <unistd.h>
+#include <signal.h>
 const char *sysname = "shellish";
 
 enum return_codes {
@@ -429,6 +432,245 @@ void run_pipeline(struct command_t *cmd, int in_fd) {
   }
 }
 
+//part 3
+void builtin_cut(struct command_t *command) {
+  char delimiter = '\t'; 
+  int fields[256];      
+  int field_count = 0;
+
+  for (int i = 1; i < command->arg_count - 1; i++) {
+    if (command->args[i] == NULL) break;
+
+    if (strcmp(command->args[i], "-d") == 0 ||
+        strcmp(command->args[i], "--delimiter") == 0) {
+      if (i + 1 < command->arg_count - 1 && command->args[i + 1] != NULL) {
+        delimiter = command->args[i + 1][0];
+        i++;
+      }
+    }
+
+    else if (strcmp(command->args[i], "-f") == 0 || strcmp(command->args[i], "--fields") == 0) {
+      if (i + 1 < command->arg_count - 1 && command->args[i + 1] != NULL) {
+
+
+        char fields_buf[1024];
+        strncpy(fields_buf, command->args[i + 1], sizeof(fields_buf));
+        char *token = strtok(fields_buf, ",");
+
+        while (token != NULL && field_count < 256) {
+
+          fields[field_count++] = atoi(token); 
+          token = strtok(NULL, ",");
+
+
+        }
+        i++; 
+
+      }
+
+
+
+    }
+  }
+
+
+  if (field_count == 0) {
+    fprintf(stderr, "cut: -f option required\n");
+    return;
+  }
+
+
+  char line[4096];
+  while (fgets(line, sizeof(line), stdin) != NULL) {
+    int line_len = strlen(line);
+    if (line_len > 0 && line[line_len - 1] == '\n')
+      line[line_len - 1] = '\0';
+
+
+
+    char *parts[1024];
+    int part_count = 0;
+    char line_copy[4096];
+    strncpy(line_copy, line, sizeof(line_copy));
+
+  
+
+    char *p = line_copy;
+    while (part_count < 1024) {
+
+      parts[part_count++] = p;
+      char *found = strchr(p, delimiter);
+      if (found == NULL) break; 
+      *found = '\0';          
+      p = found + 1;    
+
+    }
+
+    for (int i = 0; i < field_count; i++) {
+      int idx = fields[i] - 1;
+      if (idx >= 0 && idx < part_count)
+        printf("%s", parts[idx]);
+      if (i < field_count - 1) printf("%c", delimiter);
+
+    }
+    printf("\n");
+  }
+}
+
+//part 3 chatroom
+void send_message(const char *room_path, const char *username, const char *msg) {
+  DIR *dir = opendir(room_path);
+  if (!dir) return;
+
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0) continue;
+    if (strcmp(entry->d_name, "..") == 0) continue;
+    if (strcmp(entry->d_name, username) == 0) continue;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+      char pipe_path[1024];
+      snprintf(pipe_path, sizeof(pipe_path), "%s/%s", room_path, entry->d_name);
+
+    
+      int fd = open(pipe_path, O_WRONLY | O_NONBLOCK);
+      if (fd != -1) {
+        write(fd, msg, strlen(msg));
+        close(fd);
+      }
+      exit(0);
+    }
+  }
+  closedir(dir);
+
+  while (wait(NULL) > 0);
+}
+
+
+void reader_process(const char *my_pipe, const char *room, const char *username) {
+  int fd = open(my_pipe, O_RDONLY);
+  if (fd == -1) { perror("open pipe for reading"); exit(1); }
+
+  char buf[4096];
+  while (1) {
+    int n = read(fd, buf, sizeof(buf) - 1);
+    if (n > 0) {
+      buf[n] = '\0';
+      printf("\r%s\n[%s] %s > ", buf, room, username);
+      fflush(stdout);
+    }
+  }
+}
+
+void builtin_chatroom(struct command_t *command) {
+  if (command->arg_count < 4) {
+    fprintf(stderr, "Usage: chatroom <roomname> <username>\n");
+    return;
+  }
+
+  const char *roomname = command->args[1];
+  const char *username = command->args[2];
+
+  char room_path[1024];
+  snprintf(room_path, sizeof(room_path), "/tmp/chatroom-%s", roomname);
+
+  if (mkdir(room_path, 0777) == -1 && errno != EEXIST) {
+    perror("mkdir room");
+    return;
+  }
+
+  char my_pipe[2048];
+  snprintf(my_pipe, sizeof(my_pipe), "%s/%s", room_path, username);
+
+  if (mkfifo(my_pipe, 0666) == -1 && errno != EEXIST) {
+    perror("mkfifo");
+    return;
+  }
+
+  printf("Welcome to %s!\n", roomname);
+  fflush(stdout);
+
+  pid_t reader_pid = fork();
+  if (reader_pid == 0) {
+    reader_process(my_pipe, roomname, username);
+    exit(0);
+  }
+
+
+  struct termios normal_termios;
+  tcgetattr(STDIN_FILENO, &normal_termios);
+  normal_termios.c_lflag |= (ICANON | ECHO);
+  tcsetattr(STDIN_FILENO, TCSANOW, &normal_termios);
+
+
+  char input[4096];
+  while (1) {
+    printf("[%s] %s > ", roomname, username);
+    fflush(stdout);
+
+    if (fgets(input, sizeof(input), stdin) == NULL) break;
+
+    int len = strlen(input);
+    if (len > 0 && input[len - 1] == '\n') input[len - 1] = '\0';
+
+    if (strcmp(input, "exit") == 0) break;
+
+    if (strlen(input) == 0) continue;
+
+    char formatted[8192];
+    snprintf(formatted, sizeof(formatted), "[%s] %s: %s\n", roomname, username, input);
+
+    send_message(room_path, username, formatted);
+
+    printf("[%s] %s: %s\n", roomname, username, input);
+    fflush(stdout);
+  }
+
+  kill(reader_pid, SIGTERM);
+  waitpid(reader_pid, NULL, 0);
+
+  printf("Left room %s.\n", roomname);
+}
+
+//remind 
+void builtin_remind(struct command_t *command) {
+  if (command->arg_count < 4) {
+    fprintf(stderr, "Usage: remind <seconds> <message>\n");
+    fprintf(stderr, "Example: remind 10 cay koydun\n");
+    return;
+  }
+
+  int seconds = atoi(command->args[1]);
+  if (seconds <= 0) {
+    fprintf(stderr, "remind: seconds must be a positive number\n");
+    return;
+  }
+
+  char message[4096] = "";
+  for (int i = 2; i < command->arg_count - 1; i++) {
+    if (command->args[i] == NULL) break;
+    if (i > 2) strncat(message, " ", sizeof(message) - strlen(message) - 1);
+    strncat(message, command->args[i], sizeof(message) - strlen(message) - 1);
+  }
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    sleep(seconds);
+    printf("\n\n--------------------\n");
+    printf("REMINDER: %-14s\n", message);
+    printf("--------------------\n\n");
+    fflush(stdout);
+    exit(0);
+  } else if (pid > 0) {
+
+    printf("Reminder set: \"%s\" in %d second(s)\n", message, seconds);
+    waitpid(pid, NULL, WNOHANG);
+  } else {
+    perror("fork");
+  }
+}
+
 int process_command(struct command_t *command) {
   int r;
   if (strcmp(command->name, "") == 0)
@@ -444,6 +686,24 @@ int process_command(struct command_t *command) {
         printf("-%s: %s: %s\n", sysname, command->name, strerror(errno));
       return SUCCESS;
     }
+  }
+
+  //part 3 buit in cut
+  if (strcmp(command->name, "cut") == 0) {
+    builtin_cut(command);
+    return SUCCESS;
+  }
+
+  // part 3 b builtin chatroom
+  if (strcmp(command->name, "chatroom") == 0) {
+    builtin_chatroom(command);
+    return SUCCESS;
+  }
+
+  // part 3 c builtin remind
+  if (strcmp(command->name, "remind") == 0) {
+    builtin_remind(command);
+    return SUCCESS;
   }
 
   if (command->next != NULL) {
