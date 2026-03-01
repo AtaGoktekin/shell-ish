@@ -306,6 +306,51 @@ int prompt(struct command_t *command) {
   return SUCCESS;
 }
 
+
+// looks in path, if it finds will return 0 if not -1
+int resolve_path(const char *name, char *result, size_t result_size) {
+    
+  if (name[0] == '/') {
+    if (access(name, X_OK) == 0) {
+      strncpy(result, name, result_size);
+
+      return 0;
+
+
+    }
+
+    return -1;
+  }
+
+  char *path_env = getenv("PATH");
+  if (!path_env){
+
+     return -1;
+
+  }
+   
+
+  char path_copy[4096];
+  strncpy(path_copy, path_env, sizeof(path_copy));
+
+  char *dir = strtok(path_copy, ":");
+  while (dir != NULL) {
+
+
+    snprintf(result, result_size, "%s/%s", dir, name);
+
+
+    // can it run?
+    if (access(result, X_OK) == 0)
+      return 0; // found
+
+    dir = strtok(NULL, ":");
+
+  }
+
+  return -1; // not found
+}
+
 int process_command(struct command_t *command) {
   int r;
   if (strcmp(command->name, "") == 0)
@@ -324,7 +369,7 @@ int process_command(struct command_t *command) {
   }
 
   pid_t pid = fork();
-  if (pid == 0) // child
+  if (pid == 0)  // child
   {
     /// This shows how to do exec with environ (but is not available on MacOs)
     // extern char** environ; // environment variables
@@ -336,13 +381,31 @@ int process_command(struct command_t *command) {
 
     // TODO: do your own exec with path resolving using execv()
     // do so by replacing the execvp call below
-    execvp(command->name, command->args); // exec+args+path
+    //execvp(command->name, command->args); // exec+args+path
+  
+    // execv 
+    char resolved[4096];
+    if (resolve_path(command->name, resolved, sizeof(resolved)) == 0) {
+      execv(resolved, command->args);
+    }
+
     printf("-%s: %s: command not found\n", sysname, command->name);
     exit(127);
-  } else {
-    // TODO: implement background processes here
-    wait(0); // wait for child process to finish
+
+  } else if (pid > 0) {
+    if (command->background) {
+      printf("[background] PID: %d\n", pid);
+      waitpid(pid, NULL, WNOHANG);
+    } else {
+
+      waitpid(pid, NULL, 0);
+
+    }
     return SUCCESS;
+
+  } else {
+    perror("fork");
+    return UNKNOWN;
   }
 }
 
@@ -350,7 +413,7 @@ int main() {
   while (1) {
     struct command_t *command =
         (struct command_t *)malloc(sizeof(struct command_t));
-    memset(command, 0, sizeof(struct command_t)); // set all bytes to 0
+    memset(command, 0, sizeof(struct command_t));
 
     int code;
     code = prompt(command);
