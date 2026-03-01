@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>       
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -351,6 +352,83 @@ int resolve_path(const char *name, char *result, size_t result_size) {
   return -1; // not found
 }
 
+
+
+//part 2 
+void exec_command(struct command_t *command, int in_fd, int out_fd) {
+
+  if (command->redirects[0]) {
+    int fd = open(command->redirects[0], O_RDONLY);
+    if (fd == -1) { perror("open input"); exit(1); }
+    dup2(fd, STDIN_FILENO); 
+    close(fd);
+  } else if (in_fd != -1) {
+    dup2(in_fd, STDIN_FILENO);
+    close(in_fd);
+
+  }
+
+
+
+  if (command->redirects[1]) {
+    int fd = open(command->redirects[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1) { perror("open output"); exit(1); }
+    dup2(fd, STDOUT_FILENO); 
+    close(fd);
+  }
+
+
+  else if (command->redirects[2]) {
+    int fd = open(command->redirects[2], O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd == -1) { perror("open append"); exit(1); }
+    dup2(fd, STDOUT_FILENO);
+    close(fd);
+  } else if (out_fd != -1) {
+
+    dup2(out_fd, STDOUT_FILENO);
+    close(out_fd);
+
+  }
+
+  char resolved[4096];
+  if (resolve_path(command->name, resolved, sizeof(resolved)) == 0) {
+    execv(resolved, command->args);
+  }
+  printf("-%s: %s: command not found\n", sysname, command->name);
+  exit(127);
+}
+
+
+//recursive 
+void run_pipeline(struct command_t *cmd, int in_fd) {
+  if (cmd->next == NULL) {
+    pid_t pid = fork();
+    if (pid == 0) {
+      exec_command(cmd, in_fd, -1);
+    } else {
+      if (in_fd != -1) close(in_fd);
+      waitpid(pid, NULL, 0);
+    }
+  } else {
+
+    int pipefd[2];
+    if (pipe(pipefd) == -1) { perror("pipe"); return; }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+    
+      close(pipefd[0]);
+      exec_command(cmd, in_fd, pipefd[1]);
+    } else {
+     
+      close(pipefd[1]);
+      if (in_fd != -1) close(in_fd);
+      run_pipeline(cmd->next, pipefd[0]); // recursive
+      waitpid(pid, NULL, 0);
+    }
+  }
+}
+
 int process_command(struct command_t *command) {
   int r;
   if (strcmp(command->name, "") == 0)
@@ -368,6 +446,24 @@ int process_command(struct command_t *command) {
     }
   }
 
+  if (command->next != NULL) {
+    if (command->background) {
+      pid_t pid = fork();
+      if (pid == 0) {
+
+        run_pipeline(command, -1);
+        exit(0);
+
+      } else {
+        printf("[background] PID: %d\n", pid);
+        waitpid(pid, NULL, WNOHANG);
+      }
+    } else {
+      run_pipeline(command, -1);
+    }
+    return SUCCESS;
+  }
+
   pid_t pid = fork();
   if (pid == 0)  // child
   {
@@ -382,15 +478,19 @@ int process_command(struct command_t *command) {
     // TODO: do your own exec with path resolving using execv()
     // do so by replacing the execvp call below
     //execvp(command->name, command->args); // exec+args+path
-  
-    // execv 
+
+    /*
+    // part 1 execv
     char resolved[4096];
     if (resolve_path(command->name, resolved, sizeof(resolved)) == 0) {
       execv(resolved, command->args);
     }
-
     printf("-%s: %s: command not found\n", sysname, command->name);
     exit(127);
+          */
+
+    // part 2: I/O redirection
+    exec_command(command, -1, -1);
 
   } else if (pid > 0) {
     if (command->background) {
@@ -407,6 +507,8 @@ int process_command(struct command_t *command) {
     perror("fork");
     return UNKNOWN;
   }
+
+  return SUCCESS;
 }
 
 int main() {
